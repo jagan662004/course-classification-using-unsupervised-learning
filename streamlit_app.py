@@ -264,7 +264,7 @@ def recommendation_card(row: pd.Series):
 
 
 def main():
-    st.title("🎓 Coursera Course Recommender (Unsupervised Learning)")
+    st.title(" Course Recommender (Unsupervised Learning)")
     st.caption("Get top 10 similar courses using clustering + vector similarity.")
 
     df = load_data(DATA_PATH)
