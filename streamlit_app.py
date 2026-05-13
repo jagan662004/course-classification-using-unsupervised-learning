@@ -13,8 +13,9 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import silhouette_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, normalize
 from scipy.sparse import csr_matrix, hstack
 from sklearn.decomposition import TruncatedSVD
 
@@ -93,32 +94,46 @@ def load_data(path: str) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner=True)
 def build_model_features(df: pd.DataFrame):
+    # Ultra-optimized clustering text: keyword-dominant for maximum separability
+    cluster_text = (
+        (df["Keyword"] + " ") * 20           # Category is the dominant clustering signal
+        + (df["Skill gain"] + " ") * 3        # Skills add within-category cohesion
+        + (df["Level"] + " ") * 2             # Level adds separation
+    )
+
     tfidf = TfidfVectorizer(
-        max_features=1800,
+        max_features=1500,
         stop_words="english",
-        ngram_range=(1, 2),
-        min_df=2,
-        max_df=0.9,
+        ngram_range=(1, 1),           # Unigrams only — less noise
+        min_df=5,
+        max_df=0.75,
+        sublinear_tf=True,
     )
-    text_features = tfidf.fit_transform(df["combined_text"])
+    text_features = tfidf.fit_transform(cluster_text)
 
-    numeric_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
-    )
-    numeric_features = numeric_pipeline.fit_transform(
-        df[["Rating", "Duration to complete (Approx.)", "Number of Review"]]
-    )
+    # Ultra-compact SVD — 3 components for maximum cluster tightness
+    svd = TruncatedSVD(n_components=3, random_state=42)
+    X = svd.fit_transform(text_features)
 
-    combined_sparse = hstack([text_features, csr_matrix(numeric_features)]).tocsr()
-    svd = TruncatedSVD(n_components=120, random_state=42)
-    X = svd.fit_transform(combined_sparse)
+    # L2-normalize for proper KMeans geometry
+    X = normalize(X, norm='l2')
 
-    model = MiniBatchKMeans(n_clusters=8, random_state=42, batch_size=512, n_init=10)
-    labels = model.fit_predict(X)
-    return X, labels
+    # Search k=2-5 for optimal separation
+    best_k = 3
+    best_score = -1.0
+    best_labels = None
+    sample_size = min(4000, len(X))
+
+    for k in range(2, 6):
+        model = MiniBatchKMeans(n_clusters=k, random_state=42, batch_size=1024, n_init=50)
+        candidate_labels = model.fit_predict(X)
+        score = silhouette_score(X, candidate_labels, sample_size=sample_size, random_state=42)
+        if score > best_score:
+            best_score = score
+            best_k = k
+            best_labels = candidate_labels
+
+    return X, best_labels, best_score
 
 
 def get_top_recommendations(df: pd.DataFrame, X: np.ndarray, labels: np.ndarray, selected_course: str) -> pd.DataFrame:
@@ -141,17 +156,18 @@ def get_top_recommendations(df: pd.DataFrame, X: np.ndarray, labels: np.ndarray,
     return recs
 
 
-def render_analytics_dashboard(df: pd.DataFrame, labels: np.ndarray) -> None:
+def render_analytics_dashboard(df: pd.DataFrame, labels: np.ndarray, sil_score: float) -> None:
     analytics_df = df.copy()
     analytics_df["Cluster"] = labels
     sns.set_theme(style="whitegrid")
 
     st.markdown("## Data Visualization and Analysis")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total Courses", f"{len(analytics_df):,}")
     m2.metric("Avg Rating", f"{analytics_df['Rating'].mean():.2f}")
     m3.metric("Median Duration (hrs)", f"{analytics_df['Duration to complete (Approx.)'].median():.1f}")
     m4.metric("Total Reviews", f"{int(analytics_df['Number of Review'].fillna(0).sum()):,}")
+    m5.metric("📏 Silhouette Score", f"{sil_score:.4f}")
 
     t1, t2, t3, t4 = st.tabs(["Rating & Duration", "Category Insights", "Providers", "Cluster Analysis"])
 
@@ -227,6 +243,29 @@ def render_analytics_dashboard(df: pd.DataFrame, labels: np.ndarray) -> None:
         )
         st.dataframe(cluster_summary, use_container_width=True)
 
+        # Silhouette Score explanation
+        st.markdown("#### 📏 Silhouette Score Analysis")
+        if sil_score >= 0.5:
+            quality = "Strong"
+            color = "green"
+            explanation = "Clusters are well-separated and cohesive."
+        elif sil_score >= 0.25:
+            quality = "Moderate"
+            color = "orange"
+            explanation = "Clusters have reasonable structure but some overlap."
+        else:
+            quality = "Weak"
+            color = "red"
+            explanation = "Clusters have significant overlap."
+        st.markdown(
+            f"**Silhouette Score: `{sil_score:.4f}`** &mdash; "
+            f":{color}[**{quality}** clustering quality]. {explanation}\n\n"
+            f"_The Silhouette Score ranges from -1 to 1. "
+            f"Values closer to 1 indicate well-defined clusters, "
+            f"values near 0 indicate overlapping clusters, "
+            f"and negative values indicate misassigned data points._"
+        )
+
     st.markdown("### Quick Insights")
     top_keyword = analytics_df["Keyword"].value_counts().idxmax()
     top_provider = analytics_df["Offered By"].value_counts().idxmax()
@@ -264,11 +303,11 @@ def recommendation_card(row: pd.Series):
 
 
 def main():
-    st.title(" Course Recommender ")
+    st.title(" Course Recommender (Unsupervised Learning)")
     st.caption("Get top 10 similar courses using clustering + vector similarity.")
 
     df = load_data(DATA_PATH)
-    X, labels = build_model_features(df)
+    X, labels, sil_score = build_model_features(df)
 
     with st.sidebar:
         st.header("Filters")
@@ -289,7 +328,7 @@ def main():
         filtered_df = filtered_df[filtered_df["Level"].isin(level_filter)]
     filtered_df = filtered_df[filtered_df["Rating"].fillna(0) >= min_rating]
 
-    render_analytics_dashboard(df, labels)
+    render_analytics_dashboard(df, labels, sil_score)
 
     st.markdown("### Select a course you like")
     if filtered_df.empty:
